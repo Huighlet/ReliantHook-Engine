@@ -7,12 +7,14 @@ inspection & replay, circuit breaker health telemetry, and settlement reconcilia
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from relianthook.circuit import CircuitBreakerRegistry, CircuitState
@@ -87,6 +89,87 @@ dispatcher = WebhookDispatcher(
     base_backoff_sec=0.5,
     max_backoff_sec=10.0,
 )
+
+
+class WebhookRateLimiter:
+    """Token bucket rate limiter for webhook gateway."""
+    def __init__(self, capacity: int = 1000, refill_rate: float = 200.0) -> None:
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.refill_rate = refill_rate
+        self.last_ts = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> Tuple[bool, int]:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_ts
+            self.last_ts = now
+            self.tokens = min(float(self.capacity), self.tokens + elapsed * self.refill_rate)
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, int(self.tokens)
+            return False, 0
+
+
+_limiter = WebhookRateLimiter(capacity=1000, refill_rate=200.0)
+
+
+@app.middleware("http")
+async def enterprise_middleware(request: Request, call_next):
+    allowed, remaining = _limiter.consume()
+    if not allowed:
+        return Response(
+            content='{"detail": "Rate limit exceeded. Webhook gateway saturated."}',
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            media_type="application/json",
+            headers={"Retry-After": "1"},
+        )
+
+    configured_key = os.environ.get("RELIANTHOOK_API_KEY")
+    if configured_key and request.url.path.startswith("/v1/"):
+        req_key = request.headers.get("X-API-Key")
+        if req_key != configured_key:
+            return Response(
+                content='{"detail": "Unauthorized: Invalid or missing X-API-Key header"}',
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                media_type="application/json",
+            )
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    return response
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["Observability"])
+def get_metrics() -> PlainTextResponse:
+    """Prometheus metrics endpoint for delivery rates, DLQ depth, and circuits."""
+    telem = dispatcher.get_telemetry()
+    with circuit_registry._lock:
+        total_circuits = len(circuit_registry._breakers)
+        open_circuits = sum(1 for b in circuit_registry._breakers.values() if b.state == CircuitState.OPEN)
+
+    lines = [
+        "# HELP relianthook_dispatches_total Total webhook delivery attempts initiated",
+        "# TYPE relianthook_dispatches_total counter",
+        f"relianthook_dispatches_total {telem['total_dispatched']}",
+        "# HELP relianthook_delivered_total Total webhooks successfully acknowledged (2xx)",
+        "# TYPE relianthook_delivered_total counter",
+        f"relianthook_delivered_total {telem['total_delivered']}",
+        "# HELP relianthook_failed_attempts_total Total failed transmission attempts",
+        "# TYPE relianthook_failed_attempts_total counter",
+        f"relianthook_failed_attempts_total {telem['total_failed_attempts']}",
+        "# HELP relianthook_dlq_depth Current count of dead-lettered events",
+        "# TYPE relianthook_dlq_depth gauge",
+        f"relianthook_dlq_depth {telem['dlq_count']}",
+        "# HELP relianthook_circuits_open Number of destination circuits in OPEN state",
+        "# TYPE relianthook_circuits_open gauge",
+        f"relianthook_circuits_open {open_circuits}",
+        "# HELP relianthook_circuits_total Total monitored endpoint circuits",
+        "# TYPE relianthook_circuits_total gauge",
+        f"relianthook_circuits_total {total_circuits}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -335,6 +418,56 @@ def run_reconciliation(req: ReconcileRequest):
         "volume_variance": report.volume_variance,
         "is_clean": report.is_clean,
         "discrepancies": report.discrepancies,
+    }
+
+
+@app.post("/v1/dlq/redrive", tags=["DLQ"])
+def redrive_all_dlq():
+    """Bulk redrive all events currently in the Dead-Letter Queue."""
+    events = dispatcher.get_dlq_events()
+    redriven = 0
+    errors = 0
+    for e in events:
+        try:
+            dispatcher.replay_dlq_event(e.event_id)
+            redriven += 1
+        except Exception:
+            errors += 1
+    return {
+        "status": "REDRIVE_COMPLETED",
+        "redriven_count": redriven,
+        "failed_count": errors,
+        "remaining_dlq": len(dispatcher.get_dlq_events()),
+    }
+
+
+@app.post("/v1/reconcile/export", tags=["Reconciliation"])
+def export_reconciliation_bundle(req: ReconcileRequest):
+    """Execute 3-way reconciliation and export a signed audit bundle."""
+    import hashlib
+    reconciler = SettlementReconciler()
+    report = reconciler.reconcile(
+        reconciliation_date=time.strftime("%Y-%m-%d"),
+        switch_records=req.switch_records,
+        ledger_records=req.ledger_records,
+        webhook_records=req.webhook_records or [],
+    )
+    bundle_id = f"RECON_{time.strftime('%Y%m%d_%H%M%S')}"
+    seal = hashlib.sha256(f"{bundle_id}:{report.matched_count}:{report.discrepancy_count}:{report.volume_variance}".encode("utf-8")).hexdigest()
+    return {
+        "bundle_id": bundle_id,
+        "integrity_seal": seal,
+        "report": {
+            "reconciliation_date": report.reconciliation_date,
+            "total_records": report.total_records,
+            "matched_count": report.matched_count,
+            "discrepancy_count": report.discrepancy_count,
+            "net_switch_volume": report.net_switch_volume,
+            "net_ledger_volume": report.net_ledger_volume,
+            "volume_variance": report.volume_variance,
+            "is_clean": report.is_clean,
+            "discrepancies": report.discrepancies,
+        },
     }
 
 
