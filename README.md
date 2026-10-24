@@ -221,7 +221,68 @@ dispatcher.shutdown()
 
 ---
 
-## 9. CLI Usage
+## 9. Turnkey REST API Server & Docker Deployment
+
+ReliantHook-Engine includes an asynchronous, production-ready Webhook Gateway REST service and interactive developer UI.
+
+### 1. Launch Server via CLI
+
+```bash
+# Start standalone service on port 8081
+relianthook serve --host 0.0.0.0 --port 8081
+```
+
+Once running:
+- **Interactive Swagger Documentation:** [`http://localhost:8081/docs`](http://localhost:8081/docs)
+- **Engine Metrics & Liveness:** [`http://localhost:8081/health`](http://localhost:8081/health)
+- **Dead-Letter Queue (DLQ):** [`http://localhost:8081/v1/dlq`](http://localhost:8081/v1/dlq)
+- **Active Circuit Breaker States:** [`http://localhost:8081/v1/circuits`](http://localhost:8081/v1/circuits)
+
+### 2. Standalone Container Execution (Docker)
+
+```bash
+# Build production image
+docker build -t relianthook-engine:latest .
+
+# Run container with mapped port
+docker run -d --name relianthook-gateway -p 8081:8081 relianthook-engine:latest
+
+# Verify health status
+curl -s http://localhost:8081/health
+```
+
+### 3. REST API Usage Examples
+
+**Publish and Dispatch Webhook:**
+```bash
+curl -X POST http://localhost:8081/v1/webhooks/publish \
+  -H "Content-Type: application/json" \
+  -d '{
+    "destination_url": "https://httpbin.org/post",
+    "event_type": "charge.success",
+    "payload": {
+      "transaction_id": "tx_998822",
+      "amount": 25000,
+      "currency": "GHS",
+      "customer_email": "client@example.com"
+    },
+    "sync": true
+  }'
+```
+
+**Query Dead-Letter Queue (DLQ):**
+```bash
+curl -s http://localhost:8081/v1/dlq
+```
+
+**Replay Dead-Letter Event:**
+```bash
+curl -X POST http://localhost:8081/v1/dlq/replay/evt_fail_test_001
+```
+
+---
+
+## 10. CLI Usage
 
 ### 1. Compute HMAC-SHA256 Webhook Signature
 
@@ -277,15 +338,15 @@ Discrepancy Breakdown:
 
 ---
 
-## 10. Test Suite Execution
+## 11. Test Suite Execution
 
-Run the complete 16-case test suite covering HMAC verification, jitter distribution, circuit breaker trips, and 3-way reconciliation:
+Run the complete 22-case test suite covering HMAC verification, jitter distribution, circuit breaker trips, 3-way reconciliation, and REST endpoints:
 
 ```bash
 pytest -v
 ```
 
-All 16 test scenarios pass deterministically:
+All 22 test scenarios pass deterministically:
 ```text
 tests/test_backoff.py::test_exponential_backoff_bounds PASSED
 tests/test_backoff.py::test_full_jitter_distribution PASSED
@@ -303,10 +364,16 @@ tests/test_reconciler.py::test_reconciliation_missing_in_ledger PASSED
 tests/test_reconciler.py::test_reconciliation_missing_in_switch PASSED
 tests/test_reconciler.py::test_reconciliation_volume_mismatch PASSED
 tests/test_reconciler.py::test_reconciliation_undelivered_webhook PASSED
+tests/test_server.py::test_health_check PASSED
+tests/test_server.py::test_root_dashboard PASSED
+tests/test_server.py::test_crypto_sign_and_verify PASSED
+tests/test_server.py::test_publish_webhook_success PASSED
+tests/test_server.py::test_publish_webhook_failure_and_dlq PASSED
+tests/test_server.py::test_reconciliation_endpoint PASSED
 ```
 
 ---
 
-## 11. License
+## 12. License
 
 MIT License. Copyright (c) 2026 Huighlet Eyram Zowonu.

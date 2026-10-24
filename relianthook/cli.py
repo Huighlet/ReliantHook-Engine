@@ -149,8 +149,16 @@ def main() -> None:
     # Reconcile
     reconcile_p = subparsers.add_parser("reconcile", help="Execute sample 3-way settlement audit")
 
+    # Serve
+    serve_p = subparsers.add_parser("serve", help="Launch FastAPI Webhook Gateway REST service")
+    serve_p.add_argument("--host", default="0.0.0.0", help="Binding host address")
+    serve_p.add_argument("--port", type=int, default=8081, help="Binding port (default: 8081)")
+
     args = parser.parse_args()
-    if args.command == "sign":
+    if args.command == "serve":
+        from relianthook.server import serve
+        serve(host=args.host, port=args.port)
+    elif args.command == "sign":
         cmd_sign(args.payload, args.secret)
     elif args.command == "verify":
         cmd_verify(args.payload, args.sig, args.secret, args.tolerance)
