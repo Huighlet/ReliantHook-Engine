@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relianthook-engine"
+version = "1.0.0"
+description = "Zero-Loss Webhook Dispatcher & End-of-Day Settlement Reconciler"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Huighlet Eyram Zowonu", email = "eyramhuighlet@gmail.com" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.scripts]
+relianthook = "relianthook.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
